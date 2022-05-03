@@ -1,0 +1,542 @@
+---
+title: "H&E to ST"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r include = FALSE}
+knitr::opts_chunk$set(echo=FALSE)
+
+```
+
+```{r libraries, include=FALSE}
+# library(spatialRF)
+# library(ranger)
+library(stringr)
+library(Rcpp)
+library(viridis)
+library(ggplot2)
+library(kableExtra)
+library(randomForestExplainer)
+library(tidyverse)
+library(randomForest)
+library(ggpubr)
+```
+
+
+```{r defineFunctions, echo=FALSE}
+get_data <- function(directory, prefix){
+  # read in locations with gene expression info
+  count_input = read.table(paste(directory, "CountsForSquares_", prefix, ".txt", sep=""), sep="\t", header=TRUE, fill=TRUE, stringsAsFactors=FALSE)
+  
+  # read in text file with features
+  feature_input = read.table(paste(directory, "extracted_features_", prefix, ".csv", sep=""), sep=",", header=TRUE, fill=TRUE, stringsAsFactors=FALSE )
+  
+  # remove squares that have zeroes for the whole row
+  count_positive = count_input[which(rowSums(count_input) > 0),]
+  
+  comparable_patch_names = lapply(row.names(count_positive), function(x){
+    return(paste("patch_", x, sep=""))
+  })
+  
+  feature_positive = feature_input[which(feature_input$X %in% comparable_patch_names),]
+  feature_positive$X = str_split_fixed(feature_positive$X, "_", 2)[,2]
+  
+  # MERGE data, don't just cbind it
+  merged_data = merge(count_positive, feature_positive, by.x=0, by.y = "X") %>% column_to_rownames(var="Row.names")
+  
+  # return combined dataframe PLUS differentiation btw gene and feature columns
+  return(list(
+         all_data = merged_data,
+         gene_names = colnames(count_positive),
+         feature_names = setdiff(colnames(feature_positive), "X"))
+  )
+}
+
+
+mold_data_for_model <- function(raw_data, dependent, num_features=NULL){
+  # by default, we use all of the features available to us
+  features_to_use = raw_data[["feature_names"]]
+  
+  # if we only want to use a few features, we do this here
+  if (!is.null(num_features)){
+    features_to_use = head(features_to_use, num_features)
+  }
+  
+  return(raw_data[["all_data"]][, c(dependent, features_to_use)])
+}
+
+
+binarize_data <- function(molded_data, dependent.variable.name, threshold=NULL){
+  data_binarized = molded_data
+  
+  # if we are not given a threshold, use the mean
+  if (is.null(threshold)){
+    threshold = mean(data_binarized[,dependent.variable.name])
+  }
+  
+  # binarize based on threshold
+  data_binarized[which(data_binarized[,dependent.variable.name] <= threshold), dependent.variable.name] = 0
+  data_binarized[which(data_binarized[,dependent.variable.name] > 0), dependent.variable.name] = 1
+  
+  # convert to factor (required for random forest classification)
+  data_binarized[,dependent.variable.name] = as.factor(data_binarized[,dependent.variable.name])
+  
+  return(data_binarized)
+}
+```
+
+## Introduction
+We have two spatial transcriptomics samples with accompanying H&E images. The goal is to predict gene expression using random forests. 
+
+## Non-Spatial Random Forests
+In this section, I'll create two RF models (one for each of our two images) and use them to predict THY1 expression in the other sample.
+
+
+``` {r}
+B1_data <- get_data("/Users/morganoneka/Dropbox (University of Michigan)/from_box/My Stuff/KimiaNet/", "brain1A_normalized")
+B1_molded <- mold_data_for_model(B1_data, dependent="THY1", 100)
+B1_binarized <- binarize_data(B1_molded, "THY1")
+
+
+B2_data <- get_data("/Users/morganoneka/Dropbox (University of Michigan)/from_box/My Stuff/KimiaNet/", "brain1D")
+B2_molded <- mold_data_for_model(B2_data, dependent="THY1", 100)
+B2_binarized <- binarize_data(B2_molded, "THY1")
+
+
+# print(B1_binarized[1:5,1:10])
+
+# print(B2_binarized[1:5,1:10])
+
+```
+
+
+### Sample 1 model
+First, let's try making a model based on sample 1
+```{r include=TRUE}
+
+B1_weight_neg = 1
+B1_weight_pos = sum(B1_binarized$THY1 == 1) / nrow(B1_binarized)
+
+B1_thy1 <- randomForest(THY1 ~ ., 
+                                  data = B1_binarized,
+                                  ntree=1000,
+                                  sampsize=c(90,90),
+                                  importance = TRUE)
+
+print(B1_thy1)
+# plot(B1_thy1)
+```
+
+
+
+
+### Sample 2 model
+```{r createModel2}
+B2_thy1 <- randomForest(THY1 ~ ., 
+                                  data = B2_binarized, 
+                                  ntree=1000,
+                                  sampsize=c(100,100),
+                                  importance = TRUE)
+
+print(B2_thy1)
+# plot(B2_thy1)
+```
+
+## Prediction
+
+Next, we'll look at how the models perform when run on the opposite sample
+
+```{r include=TRUE}
+B1_thy1_prediction <- predict(B1_thy1, newdata=B2_binarized)
+B1_thy1_accuracy <- as.data.frame(cbind(B2_binarized[,"THY1"], B1_thy1_prediction))
+colnames(B1_thy1_accuracy) <- c("Actual", "Predicted")
+prop.table(table(B1_thy1_accuracy), margin=1)
+
+```
+
+```{r include=TRUE}
+B2_thy1_prediction <- predict(B2_thy1, newdata=B1_binarized)
+B2_thy1_accuracy <- as.data.frame(cbind(B1_binarized[,"THY1"], B2_thy1_prediction))
+colnames(B2_thy1_accuracy) <- c("Actual", "Predicted")
+prop.table(table(B2_thy1_accuracy), margin=1)
+```
+
+We see that both models predict "1" (low THY1 expression) really well, but "2" (high THY1 expression) is being mis-classified frequently.
+
+## Re-running workflow with global thresholding
+
+One possible fix could be to use "global" thresholding, i.e. binarizing the data based on the GLOBAL mean.
+
+```{r include=TRUE}
+mean_thy1 = mean(c(B1_molded$THY1, B2_molded$THY1))
+print(mean_thy1)
+
+B1_binarized_new  <- binarize_data(B1_molded, "THY1", mean_thy1)
+B2_binarized_new  <- binarize_data(B2_molded, "THY1", mean_thy1)
+
+```
+
+
+Next, we'll use this newly thresholded data to create new random forest models.
+
+```{r include=TRUE}
+
+B1_thy1_new <- randomForest(THY1 ~ ., 
+                                  data = B1_binarized_new, 
+                                  ntree=1000,
+                                  sampsize=c(80,80),
+                                  importance = TRUE)
+print(B1_thy1_new)
+
+B2_thy1_new <- randomForest(THY1 ~ ., 
+                                  data = B2_binarized_new, 
+                                  ntree=1000,
+                                  sampsize=c(100,100),
+                                  importance = TRUE)
+print(B2_thy1_new)
+
+```
+
+
+
+```{r include=TRUE}
+B1_thy1_prediction <- predict(B1_thy1_new, newdata=B2_binarized_new)
+B1_thy1_accuracy <- as.data.frame(cbind(B2_binarized_new[,"THY1"], B1_thy1_prediction))
+colnames(B1_thy1_accuracy) <- c("Actual", "Predicted")
+prop.table(table(B1_thy1_accuracy),margin=1)
+
+B2_thy1_prediction <- predict(B2_thy1_new, newdata=B1_binarized_new)
+B2_thy1_accuracy <- as.data.frame(cbind(B1_binarized_new[,"THY1"], B2_thy1_prediction))
+colnames(B2_thy1_accuracy) <- c("Actual", "Predicted")
+prop.table(table(B2_thy1_accuracy),margin=1)
+```
+
+Misclassification for group 2 went down slightly but is still terrible...
+
+
+## Let's try spatialrf
+
+```{r}
+
+lower_coord = str_split_fixed(rownames(B1_binarized), "_", 2)[,1] 
+x = as.numeric(gsub("[^0-9]", "", str_split_fixed(lower_coord, ",", 2)[,1]))
+y = as.numeric(gsub("[^0-9]", "", str_split_fixed(lower_coord, ",", 2)[,2]))
+
+xy = as.data.frame(cbind(x,y))
+colnames(xy) = c("x", "y")
+
+distance.matrix = dist(xy)
+```
+
+```{r}
+spatial.model <- spatialRF::rf_spatial(
+  data = B1_molded,
+  dependent.variable.name = "THY1",
+  predictor.variable.names = setdiff(colnames(B1_molded), "THY1"),
+  distance.matrix = as.matrix(distance.matrix),
+  method="hengl",
+  verbose=TRUE
+)
+```
+
+The SpatialRF model has a decent OOB R-squared and its other R-squared values are excellent. However, SpatialRF doesn't have functionality that supports prediction. I'm looking to see if there's a way I can implement my own prediction function based on the output of SpatialRF.
+
+```{r}
+
+lower_coord2 = str_split_fixed(rownames(B2_binarized), "_", 2)[,1] 
+x2 = as.numeric(gsub("[^0-9]", "", str_split_fixed(lower_coord2, ",", 2)[,1]))
+y2 = as.numeric(gsub("[^0-9]", "", str_split_fixed(lower_coord2, ",", 2)[,2]))
+
+xy2 = as.data.frame(cbind(x2,y2))
+colnames(xy2) = c("x", "y")
+
+#TODO: subset xy2 to only values in xy
+rownames(xy2) = rownames(B2_molded)
+# evaluated = rf_evaluate(model=spatial.model, xy=xy2[which(rownames(xy2) %in% rownames(xy)),])
+```
+
+## Prediction with SpatialML
+SpatialML, however, *does* include functionality for prediction, so I'm giving that a shot next.
+
+```{r}
+
+library("SpatialML")
+```
+
+
+```{r}
+
+grf_fixed <- function (formula, dframe, bw, kernel, coords, ntree = 500, mtry = NULL, 
+    importance = TRUE, forests = TRUE) 
+{
+    f <- formula(formula)
+    RNames <- attr(terms(f), "term.labels")
+    ModelVarNo <- length(RNames)
+    ntrees <- ntree
+    Obs <- nrow(dframe)
+    if (is.null(mtry)) {
+        mtry = max(floor(ModelVarNo/3), 1)
+    }
+    message("\nNumber of Observations: ", Obs)
+    message("Number of Independent Variables: ", ModelVarNo)
+    if (kernel == "adaptive") {
+        Ne <- bw
+        message("Kernel: Adaptive\nNeightbours: ", Ne)
+    }
+    else {
+        if (kernel == "fixed") {
+            message("Kernel: Fixed\nBandwidth: ", bw)
+        }
+    }
+    Gl.Model <- eval(substitute(randomForest(formula, data = dframe, 
+        ntree = ntree, mtry = mtry, importance = importance)))
+    yhat <- predict(Gl.Model, dframe)
+    message("Number of Variables: ", ModelVarNo)
+    message("\n--------------- Global Model Summary ---------------\n")
+    print(Gl.Model)
+    # message("\nImportance:\n")
+    # print(importance(Gl.Model))
+    g.RSS <- sum((Gl.Model$y - yhat)^2)
+    g.mean.y <- mean(Gl.Model$y)
+    g.TSS <- sum((Gl.Model$y - g.mean.y)^2)
+    g.r <- 1 - (g.RSS/g.TSS)
+    message("\nResidual Sum of Squares (Predicted): ", round(g.RSS, 
+        3))
+    message("R-squared (Predicted) %: ", round(100 * g.r, 3))
+    DistanceT <- dist(coords)
+    Dij <- as.matrix(DistanceT)
+    if (forests == TRUE) {
+        LM_Forests <- as.list(rep(NA, length(ntrees)))
+    }
+    LM_LEst1 <- as.data.frame(setNames(replicate(ModelVarNo, 
+        numeric(0), simplify = F), RNames[1:ModelVarNo]))
+    LM_LEst2 <- as.data.frame(setNames(replicate(ModelVarNo, 
+        numeric(0), simplify = F), RNames[1:ModelVarNo]))
+    LM_GofFit <- data.frame(y = numeric(0), LM_yfitOOB = numeric(0), 
+        LM_ResOOB = numeric(0), LM_yfitPred = numeric(0), LM_ResPred = numeric(0), 
+        LM_MSR = numeric(0), LM_Rsq100 = numeric(0))
+    for (m in 1:Obs) {
+        DNeighbour <- Dij[, m]
+        DataSet <- data.frame(dframe, DNeighbour = DNeighbour)
+        DataSetSorted <- DataSet[order(DataSet$DNeighbour), ]
+        if (kernel == "adaptive") {
+            SubSet <- DataSetSorted[1:Ne, ]
+            Kernel_H <- max(SubSet$DNeighbour)
+        }
+        else {
+            if (kernel == "fixed") {
+                SubSet <- subset(DataSetSorted, DNeighbour <= 
+                  bw)
+                Kernel_H <- bw
+            }
+        }
+        Wts <- (1 - (SubSet$DNeighbour/Kernel_H)^2)^2
+        Lcl.Model <- eval(substitute(randomForest(formula, data = SubSet, 
+            ntree = ntree, mtry = mtry, importance = importance)))
+        if (forests == TRUE) {
+            LM_Forests[[m]] <- Lcl.Model
+        }
+        for (j in 1:ModelVarNo) {
+            LM_LEst1[m, j] <- importance(Lcl.Model)[j, 1]
+            LM_LEst2[m, j] <- importance(Lcl.Model)[j, 2]
+        }
+        LM_GofFit[m, 1] <- Gl.Model$y[m]
+        LM_GofFit[m, 2] <- Lcl.Model$predicted[[1]]
+        LM_GofFit[m, 3] <- LM_GofFit[m, 1] - LM_GofFit[m, 2]
+        LM_GofFit[m, 4] <- predict(Lcl.Model, dframe[m, ])
+        LM_GofFit[m, 5] <- LM_GofFit[m, 1] - LM_GofFit[m, 4]
+        LM_GofFit[m, 6] <- Lcl.Model$mse[ntrees]
+        LM_GofFit[m, 7] <- 100 * Lcl.Model$rsq[ntrees]
+    }
+    if (forests == TRUE) {
+        grf.out <- list(Global.Model = Gl.Model, Locations = coords, 
+            Local.Pc.IncMSE = LM_LEst1, Local.IncNodePurity = LM_LEst2, 
+            LGofFit = LM_GofFit, Forests = LM_Forests)
+    }
+    else {
+        grf.out <- list(Global.Model = Gl.Model, Locations = coords, 
+            Local.Pc.IncMSE = LM_LEst1, Local.IncNodePurity = LM_LEst2, 
+            LGofFit = LM_GofFit)
+    }
+    message("\n--------------- Local Model Summary ---------------\n")
+    message("\nResiduals OOB:\n")
+    print(summary(grf.out$LGofFit$LM_ResOOB))
+    message("\nResiduals Predicted:\n")
+    print(summary(grf.out$LGofFit$LM_ResPred))
+    t1 <- data.frame(Min = apply(grf.out$Local.Pc.IncMSE, 2, 
+        min), Max = apply(grf.out$Local.Pc.IncMSE, 2, max), Mean = apply(grf.out$Local.Pc.IncMSE, 
+        2, mean), StD = apply(grf.out$Local.Pc.IncMSE, 2, sd))
+    message("\n%IncMSE:\n")
+    print(t1)
+    t2 <- data.frame(Min = apply(grf.out$Local.IncNodePurity, 
+        2, min), Max = apply(grf.out$Local.IncNodePurity, 2, 
+        max), Mean = apply(grf.out$Local.IncNodePurity, 2, mean), 
+        StD = apply(grf.out$Local.IncNodePurity, 2, sd))
+    message("\n%IncNodePurity: \n")
+    print(t2)
+    l.RSS.OOB <- sum(grf.out$LGofFit$LM_ResOOB^2)
+    l.RSS.Pred <- sum(grf.out$LGofFit$LM_ResPred^2)
+    mean.y <- mean(grf.out$LGofFit$y)
+    TSS <- sum((grf.out$LGofFit$y - mean.y)^2)
+    l.r.OOB <- 1 - (l.RSS.OOB/TSS)
+    message("\nResidual Sum of Squares (OOB): ", round(l.RSS.OOB, 
+        3))
+    message("R-squared (OOB) %: ", round(100 * l.r.OOB, 3))
+    l.r.Pred <- 1 - (l.RSS.Pred/TSS)
+    message("Residual Sum of Squares (Predicted): ", round(l.RSS.Pred, 
+        3))
+    message("R-squared (Predicted) %: ", round(100 * l.r.Pred, 
+        3))
+    lModelSummary = list()
+    lModelSummary$l.IncMSE <- t1
+    lModelSummary$l.IncNodePurity <- t2
+    lModelSummary$l.RSS.OOB <- l.RSS.OOB
+    lModelSummary$l.r.OOB <- l.r.OOB
+    lModelSummary$l.RSS.Pred <- l.RSS.Pred
+    lModelSummary$l.r.Pred <- l.r.Pred
+    grf.out$LocalModelSummary <- lModelSummary
+    return(grf.out)
+}
+```
+
+### Building the Model
+First, I built a model using sample 2
+
+```{r}
+# set to true if we want to predict log expression
+predict_log=TRUE
+```
+
+
+```{r warning=FALSE, messsage=FALSE, results='hide', echo=FALSE}
+# rf = randomForest("THY1 ~ X0 + X1 + X2 + X3 + X4 + X5", data = B2_molded, 
+        # ntree = 500, mtry = NULL, importance = NULL)
+# Gl.Model <- eval(substitute())
+#TODO: figure out which columns don't have NAS or zero variance
+B2_molded$THY1=as.numeric(B2_molded$THY1)
+if (predict_log){
+  B2_molded$THY1 = log(B2_molded$THY1)
+  B2_molded[which(is.infinite(B2_molded$THY1)),"THY1"] = 0
+  B2_molded[which(is.na(B2_molded$THY1)), "THY1"] = 0  
+}
+
+predictors = setdiff(colnames(B2_molded)[1:101],"THY1")
+my_formula=as.formula(paste("THY1", paste(predictors, collapse=" + "), sep=" ~ "))
+grf_model = grf_fixed(my_formula, dframe=B2_molded[,c("THY1", predictors)], bw=5, kernel="adaptive", coords=xy2)
+```
+
+```{r}
+paste("OOB R^2: ", grf_model$LocalModelSummary$l.r.OOB)
+paste("Predicted R^2: ", grf_model$LocalModelSummary$l.r.Pred)
+```
+
+
+The OOB accuracy isn't great, but the predicted R-squared is quite high.
+
+```{r}
+predict.grf.fixed <- function (object, new.data, x.var.name, y.var.name, local.w = 1, 
+    global.w = 0, ...) 
+{
+    Obs <- nrow(new.data)
+    predictions <- vector(mode = "numeric", length = Obs)
+    for (i in 1:Obs) {
+        x <- new.data[i, which(names(new.data) == x.var.name)]
+        y <- new.data[i, which(names(new.data) == y.var.name)]
+        locations <- object$Locations
+        D <- sqrt((x - locations$x)^2 + (y - locations$y)^2)
+        local.model.ID <- which.min(D)
+        g.prediction <- predict(object[[1]], new.data[i, ])
+        l.prediction <- predict(object$Forests[[local.model.ID]], 
+            new.data[i, ])
+        predictions[i] <- global.w * g.prediction[1] + local.w * 
+            l.prediction[1]
+    }
+    return(predictions)
+}
+
+```
+
+### Predicting THY1 expression for sample 1
+Next, I used this model to predict THY1 expression for the first dataset.
+
+```{r}
+B1_molded$THY1=as.numeric(B1_molded$THY1)
+if (predict_log){
+  B1_molded$THY1 = log(B1_molded$THY1)
+  B1_molded[which(is.infinite(B1_molded$THY1)),"THY1"] = 0
+  B1_molded[which(is.na(B1_molded$THY1)), "THY1"] = 0  
+}
+
+predicted_expression = predict.grf.fixed(object=grf_model, new.data=cbind(B1_molded[, c("THY1", predictors)], xy), x.var.name="x", y.var.name="y", local.w=1, global.w=0)
+
+with_predictions = cbind(cbind(B1_molded[,c("THY1", predictors)], xy), predicted_expression)
+```
+
+### Statistical measures for accuracy
+
+The SpatialML prediction function doesn't give any statistics relating to accuracy, and I've seen a few different ways of measuring accuracy.
+
+
+#### Linear Regression
+
+Linear regression can give some insight into relation between actual and predicted THY1. Actual THY1 expression is not normal (heavily right skewed) so these results should be taken with a grain of salt...
+
+```{r}
+my.lm = lm(predicted_expression~THY1, data = with_predictions)
+
+summary(my.lm)
+```
+
+There is a linear relationship, however based on the THY1 coefficient, the predicted values are about 20% of what the actual THY1 values are.
+
+```{r}
+# with_predictions
+
+predicted_df <- data.frame(pred_expr = predict(my.lm, with_predictions), THY1=with_predictions$THY1)
+
+ggplot(with_predictions, aes(x=THY1, y=predicted_expression)) + geom_point() + geom_line(color='red',data = predicted_df, aes(x=THY1, y=pred_expr)) + coord_equal()
+```
+
+#### Spearman Correlation
+Another method of comparison is using Spearman Correlation. This was used in [this paper](https://cancerres.aacrjournals.org/content/81/19/51150 which predicts *bulk* RNA expression from H&E slides.
+
+```{r}
+cor.test(with_predictions$THY1, with_predictions$predicted_expression, method="spearman")
+```
+
+The expression values ARE definitely correlated... 
+
+### Spatial patterns of accuracy
+
+Next, I plotted THY1 expression. The second sample has higher overall THY1 expression, so it seems strange that running the model on the first sample would *under-predict* THY1 expression.
+
+```{r}
+b1boxplot = ggplot(B1_molded, aes(x=THY1)) + geom_boxplot() 
+b2boxplot = ggplot(B2_molded, aes(x=THY1)) + geom_boxplot()
+
+ggarrange(b1boxplot,b2boxplot, nrow=2, ncol=1, labels=c("THY1 expression for sample 1", "THY1 expression for sample 2"))
+```
+
+To further investigate, I looked at how accuracy of the model varied spatially.
+
+```{r}
+with_predictions$difference = with_predictions$THY1 - with_predictions$predicted_expression
+
+ggplot(with_predictions, aes(x=x, y=y, fill=difference)) + geom_tile() + scale_fill_gradient(low="blue", high="red")
+```
+
+The plot above shows the difference in THY1 expression (actual expression - predicted expression). There are clear spatial trends, with definitive areas that have high vs. low differences.
+
+```{r}
+ggplot(with_predictions, aes(x=x, y=y, fill=abs(difference))) + geom_tile()
+```
+
+
+The above plot shows the absolute value of the difference, showing overall distance between actual and predicted expression. Light regions are less accurate (high difference between predicted and actual THY1 expression) and dark regions are more accurate (lower difference).
+
+```{r}
+ggplot(with_predictions, aes(x=THY1, y=difference)) + geom_point()  + coord_equal()
+
+```
